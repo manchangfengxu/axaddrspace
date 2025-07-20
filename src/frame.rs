@@ -77,6 +77,7 @@ impl<H: AxMmHal> Drop for PhysFrame<H> {
 mod test {
     use super::*;
     use crate::{HostPhysAddr, HostVirtAddr};
+    use alloc::vec::Vec;
     use assert_matches::assert_matches;
     use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use lazy_static::lazy_static;
@@ -107,13 +108,17 @@ mod test {
     /// Flag to simulate memory allocation failures for testing error handling.
     static ALLOC_SHOULD_FAIL: AtomicBool = AtomicBool::new(false);
 
-    #[derive(Debug)] // Required by `Result::unwrap_err()`'s `Debug` bound on its `T` type (`PhysFrame<MockHal>`).
+    #[derive(Debug)]
     /// A mock implementation of AxMmHal for testing purposes.
+    /// It simulates memory allocation and deallocation without actual hardware interaction.
+    ///
+    /// The `Debug` trait is derived because `assert_matches!` on `Result<PhysFrame<MockHal>, _>`
+    /// requires `PhysFrame<MockHal>` (the `T` type) to implement `Debug` for diagnostic output on assertion failure.
     struct MockHal {}
 
     impl AxMmHal for MockHal {
         fn alloc_frame() -> Option<HostPhysAddr> {
-            // Use a static mutable variable to control alloc_fail state
+            // Use a static mutable variable to control alloc_should_fail state
             if ALLOC_SHOULD_FAIL.load(Ordering::SeqCst) {
                 return None;
             }
@@ -205,6 +210,43 @@ mod test {
     }
 
     #[test]
+    fn test_fill_multiple_frames() {
+        let _guard = TEST_MUTEX.lock();
+        MockHal::reset_state();
+        {
+            let mut frames = Vec::with_capacity(3); // The vector to store allocated frames
+            let fill_values = [0xAA, 0xBB, 0xCC];
+            let mut expected_paddr = BASE_PADDR; // The expected starting address of each frame
+
+            // Allocate and fill frame with its `fill_values`
+            for &value in &fill_values {
+                let mut frame = PhysFrame::<MockHal>::alloc().unwrap_or_else(|e| {
+                    panic!(
+                        "Failed to allocate frame, which filled with {:?}: {:?}",
+                        value, e
+                    )
+                });
+                assert_eq!(frame.start_paddr().as_usize(), expected_paddr);
+                frame.fill(value);
+                frames.push((frame, value)); // Store frame and its expected value
+                expected_paddr += PAGE_SIZE;
+            }
+
+            // Verify all frames
+            for (frame, expected_value) in &frames {
+                let ptr = frame.as_mut_ptr();
+                let page = unsafe { &*(ptr as *const [u8; PAGE_SIZE]) };
+                assert!(
+                    page.iter().all(|&x| x == *expected_value),
+                    "Frame verification failed for value {}",
+                    expected_value
+                );
+            }
+        }
+        assert_eq!(DEALLOC_COUNT.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
     #[should_panic(expected = "uninitialized PhysFrame")]
     fn test_uninit_access() {
         // This test verifies that accessing an uninitialized PhysFrame (created with `unsafe { uninit() }`)
@@ -221,9 +263,8 @@ mod test {
             // Configure MockHal to simulate an allocation failure.
             MockHal::set_alloc_fail(true);
             let result = PhysFrame::<MockHal>::alloc();
-            assert!(result.is_err());
             // Assert that allocation failed and verify the specific error type.
-            assert_matches!(result.unwrap_err(), axerrno::AxError::NoMemory);
+            assert_matches!(result, Err(axerrno::AxError::NoMemory));
             MockHal::set_alloc_fail(false); // Reset for other tests
         }
         assert_eq!(DEALLOC_COUNT.load(Ordering::SeqCst), 0);
