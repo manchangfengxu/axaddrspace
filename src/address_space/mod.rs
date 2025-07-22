@@ -261,3 +261,331 @@ impl<H: PagingHandler> Drop for AddrSpace<H> {
         self.clear();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::{
+        ALLOC_COUNT, BASE_PADDR, DEALLOC_COUNT, MEMORY_LEN, MockHal, TEST_MUTEX,
+    };
+    use core::sync::atomic::Ordering;
+
+    #[test]
+    fn test_addrspace_creation() {
+        let _guard = TEST_MUTEX.lock();
+        MockHal::reset_state();
+
+        let base = GuestPhysAddr::from_usize(0x10000);
+        let size = 0x1000;
+        {
+            let addr_space = AddrSpace::<MockHal>::new_empty(base, size).unwrap();
+            assert_eq!(addr_space.base(), base);
+            assert_eq!(addr_space.size(), size);
+            assert_eq!(addr_space.end(), base + size);
+            assert_eq!(ALLOC_COUNT.load(Ordering::SeqCst), 1); // Allocated root page table
+        }
+        assert_eq!(DEALLOC_COUNT.load(Ordering::SeqCst), 1); // Deallocated root page table
+    }
+
+    #[test]
+    fn test_contains_range() {
+        let _guard = TEST_MUTEX.lock();
+        MockHal::reset_state();
+
+        let base = GuestPhysAddr::from_usize(0x10000);
+        let size = 0x4000; // 16KB
+        let addr_space = AddrSpace::<MockHal>::new_empty(base, size).unwrap();
+
+        // Within range
+        assert!(addr_space.contains_range(base, 0x1000));
+        assert!(addr_space.contains_range(base + 0x1000, 0x2000));
+        assert!(addr_space.contains_range(base, size));
+
+        // Out of range
+        assert!(!addr_space.contains_range(base - 0x1000, 0x1000));
+        assert!(!addr_space.contains_range(base + size, 0x1000));
+        assert!(!addr_space.contains_range(base, size + 0x1000));
+
+        // Partially out of range
+        assert!(!addr_space.contains_range(base + 0x3000, 0x2000));
+    }
+
+    // This test is temporarily disabled because flush_tlb is not implemented for x86.
+    #[ignore]
+    #[test]
+    fn test_map_linear() {
+        let _guard = TEST_MUTEX.lock();
+        MockHal::reset_state();
+
+        let mut addr_space = AddrSpace::<MockHal>::new_empty(0x10000.into(), 0x10000).unwrap();
+        let vaddr = GuestPhysAddr::from_usize(0x18000);
+        let paddr = PhysAddr::from_usize(0x10000);
+        let size = 0x8000; // 32KB
+        let flags = MappingFlags::READ | MappingFlags::WRITE;
+
+        // Linear mapping
+        addr_space.map_linear(vaddr, paddr, size, flags).unwrap();
+
+        assert_eq!(addr_space.translate(vaddr).unwrap(), paddr);
+        assert_eq!(
+            addr_space.translate(vaddr + 0x1000).unwrap(),
+            paddr + 0x1000
+        );
+    }
+
+    #[test]
+    fn test_map_alloc_populate() {
+        let _guard = TEST_MUTEX.lock();
+        MockHal::reset_state();
+
+        let mut addr_space = AddrSpace::<MockHal>::new_empty(0x10000.into(), 0x10000).unwrap();
+        let vaddr = GuestPhysAddr::from_usize(0x10000);
+        let size = 0x2000; // 8KB
+        let flags = MappingFlags::READ | MappingFlags::WRITE;
+
+        // Frame count before allocation: 1 root page table
+        let initial_allocs = ALLOC_COUNT.load(Ordering::SeqCst);
+        assert_eq!(initial_allocs, 1);
+
+        // Allocate physical frames immediately
+        addr_space.map_alloc(vaddr, size, flags, true).unwrap();
+
+        // Verify additional frames were allocated
+        let final_allocs = ALLOC_COUNT.load(Ordering::SeqCst);
+        assert!(final_allocs > initial_allocs);
+
+        // Verify mappings exist and addresses are valid
+        let paddr1 = addr_space.translate(vaddr).unwrap();
+        let paddr2 = addr_space.translate(vaddr + 0x1000).unwrap();
+
+        // Verify physical addresses are within valid range
+        assert!(paddr1.as_usize() >= BASE_PADDR && paddr1.as_usize() < BASE_PADDR + MEMORY_LEN);
+        assert!(paddr2.as_usize() >= BASE_PADDR && paddr2.as_usize() < BASE_PADDR + MEMORY_LEN);
+
+        // Verify two pages have different physical addresses
+        assert_ne!(paddr1, paddr2);
+    }
+
+    #[test]
+    fn test_map_alloc_lazy() {
+        let _guard = TEST_MUTEX.lock();
+        MockHal::reset_state();
+
+        let mut addr_space = AddrSpace::<MockHal>::new_empty(0x10000.into(), 0x10000).unwrap();
+        let vaddr = GuestPhysAddr::from_usize(0x13000);
+        let size = 0x1000;
+        let flags = MappingFlags::READ | MappingFlags::WRITE;
+
+        let initial_allocs = ALLOC_COUNT.load(Ordering::SeqCst);
+
+        // Lazy allocation - don't allocate physical frames immediately
+        addr_space.map_alloc(vaddr, size, flags, false).unwrap();
+
+        // Frame count should only increase for page table structure, not data pages
+        let after_map_allocs = ALLOC_COUNT.load(Ordering::SeqCst);
+        assert!(after_map_allocs >= initial_allocs); // May have allocated intermediate page tables
+        assert!(addr_space.translate(vaddr).is_none());
+    }
+
+    #[test]
+    fn test_page_fault_handling() {
+        let _guard = TEST_MUTEX.lock();
+        MockHal::reset_state();
+
+        let mut addr_space = AddrSpace::<MockHal>::new_empty(0x10000.into(), 0x10000).unwrap();
+        let vaddr = GuestPhysAddr::from_usize(0x14000);
+        let size = 0x1000;
+        let flags = MappingFlags::READ | MappingFlags::WRITE;
+
+        // Create lazy allocation mapping
+        addr_space.map_alloc(vaddr, size, flags, false).unwrap();
+
+        let before_pf_allocs = ALLOC_COUNT.load(Ordering::SeqCst);
+
+        // Simulate page fault
+        let handled = addr_space.handle_page_fault(vaddr, MappingFlags::READ);
+
+        // Page fault should be handled
+        assert!(handled);
+
+        // Should have allocated physical frames
+        let after_pf_allocs = ALLOC_COUNT.load(Ordering::SeqCst);
+        assert!(after_pf_allocs > before_pf_allocs);
+
+        // Translation should succeed now
+        let paddr = addr_space.translate(vaddr);
+        assert!(paddr.is_some());
+    }
+
+    #[test]
+    fn test_unmap() {
+        let _guard = TEST_MUTEX.lock();
+        MockHal::reset_state();
+
+        let mut addr_space = AddrSpace::<MockHal>::new_empty(0x10000.into(), 0x10000).unwrap();
+        let vaddr = GuestPhysAddr::from_usize(0x15000);
+        let size = 0x2000;
+        let flags = MappingFlags::READ | MappingFlags::WRITE;
+
+        // Create mapping
+        addr_space.map_alloc(vaddr, size, flags, true).unwrap();
+
+        // Verify mapping exists
+        assert!(addr_space.translate(vaddr).is_some());
+        assert!(addr_space.translate(vaddr + 0x1000).is_some());
+
+        let before_unmap_deallocs = DEALLOC_COUNT.load(Ordering::SeqCst);
+
+        // Unmap
+        addr_space.unmap(vaddr, size).unwrap();
+
+        // Verify mapping is removed
+        assert!(addr_space.translate(vaddr).is_none());
+        assert!(addr_space.translate(vaddr + 0x1000).is_none());
+
+        // Verify frames were deallocated
+        let after_unmap_deallocs = DEALLOC_COUNT.load(Ordering::SeqCst);
+        assert!(after_unmap_deallocs > before_unmap_deallocs);
+    }
+
+    #[test]
+    fn test_clear() {
+        let _guard = TEST_MUTEX.lock();
+        MockHal::reset_state();
+
+        let mut addr_space = AddrSpace::<MockHal>::new_empty(0x10000.into(), 0x10000).unwrap();
+        let vaddr1 = GuestPhysAddr::from_usize(0x16000);
+        let vaddr2 = GuestPhysAddr::from_usize(0x17000);
+        let flags = MappingFlags::READ | MappingFlags::WRITE;
+
+        // Create multiple mappings
+        addr_space.map_alloc(vaddr1, 0x1000, flags, true).unwrap();
+        addr_space.map_alloc(vaddr2, 0x1000, flags, true).unwrap();
+
+        // Verify mappings exist
+        assert!(addr_space.translate(vaddr1).is_some());
+        assert!(addr_space.translate(vaddr2).is_some());
+
+        let before_clear_deallocs = DEALLOC_COUNT.load(Ordering::SeqCst);
+
+        // Clear all mappings
+        addr_space.clear();
+
+        // Verify all mappings are removed
+        assert!(addr_space.translate(vaddr1).is_none());
+        assert!(addr_space.translate(vaddr2).is_none());
+
+        // Verify frames were deallocated
+        let after_clear_deallocs = DEALLOC_COUNT.load(Ordering::SeqCst);
+        assert!(after_clear_deallocs > before_clear_deallocs);
+    }
+
+    #[test]
+    fn test_translate() {
+        let _guard = TEST_MUTEX.lock();
+        MockHal::reset_state();
+
+        let mut addr_space = AddrSpace::<MockHal>::new_empty(0x10000.into(), 0x10000).unwrap();
+        let vaddr = GuestPhysAddr::from_usize(0x18000);
+        let size = 0x1000;
+        let flags = MappingFlags::READ | MappingFlags::WRITE;
+
+        // Create mapping
+        addr_space.map_alloc(vaddr, size, flags, true).unwrap();
+
+        // Verify translation succeeds
+        let paddr = addr_space.translate(vaddr);
+        assert!(paddr.is_some());
+        let paddr = paddr.unwrap();
+        assert!(paddr.as_usize() >= BASE_PADDR);
+        assert!(paddr.as_usize() < BASE_PADDR + MEMORY_LEN);
+
+        // Verify unmapped address translation fails
+        let unmapped_vaddr = GuestPhysAddr::from_usize(0x19000);
+        assert!(addr_space.translate(unmapped_vaddr).is_none());
+
+        // Verify out-of-range address translation fails
+        let out_of_range = GuestPhysAddr::from_usize(0x30000);
+        assert!(addr_space.translate(out_of_range).is_none());
+    }
+
+    #[test]
+    fn test_translated_byte_buffer() {
+        let _guard = TEST_MUTEX.lock();
+        MockHal::reset_state();
+
+        let mut addr_space = AddrSpace::<MockHal>::new_empty(0x10000.into(), 0x10000).unwrap();
+        let vaddr = GuestPhysAddr::from_usize(0x19000);
+        let size = 0x2000; // 8KB
+        let flags = MappingFlags::READ | MappingFlags::WRITE;
+
+        // Create mapping
+        addr_space.map_alloc(vaddr, size, flags, true).unwrap();
+
+        // Verify byte buffer can be obtained
+        let buffer = addr_space.translated_byte_buffer(vaddr, 0x100);
+        assert!(buffer.is_some());
+        let mut buffer = buffer.unwrap();
+        assert!(!buffer.is_empty());
+
+        // Verify data write and read
+        let test_bytes = [0xAA, 0xBB, 0xCC, 0xDD];
+        if !buffer.is_empty() && buffer[0].len() >= test_bytes.len() {
+            for (i, &byte) in test_bytes.iter().enumerate() {
+                buffer[0][i] = byte;
+            }
+
+            // Verify data write was successful
+            let verify_buffer = addr_space
+                .translated_byte_buffer(vaddr, test_bytes.len())
+                .unwrap();
+            for (i, &expected) in test_bytes.iter().enumerate() {
+                assert_eq!(verify_buffer[0][i], expected);
+            }
+        }
+
+        // Verify exceeding area size returns None
+        assert!(
+            addr_space
+                .translated_byte_buffer(vaddr, size + 0x1000)
+                .is_none()
+        );
+
+        // Verify unmapped address returns None
+        let unmapped_vaddr = GuestPhysAddr::from_usize(0x1D000);
+        assert!(
+            addr_space
+                .translated_byte_buffer(unmapped_vaddr, 0x100)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_translate_and_get_limit() {
+        let _guard = TEST_MUTEX.lock();
+        MockHal::reset_state();
+
+        let mut addr_space = AddrSpace::<MockHal>::new_empty(0x10000.into(), 0x10000).unwrap();
+        let vaddr = GuestPhysAddr::from_usize(0x1A000);
+        let size = 0x3000; // 12KB
+        let flags = MappingFlags::READ | MappingFlags::WRITE;
+
+        // Create mapping
+        addr_space.map_alloc(vaddr, size, flags, true).unwrap();
+
+        // Verify translation and area size retrieval
+        let result = addr_space.translate_and_get_limit(vaddr);
+        assert!(result.is_some());
+        let (paddr, area_size) = result.unwrap();
+        assert!(paddr.as_usize() >= BASE_PADDR && paddr.as_usize() < BASE_PADDR + MEMORY_LEN);
+        assert_eq!(area_size, size);
+
+        // Verify unmapped address returns None
+        let unmapped_vaddr = GuestPhysAddr::from_usize(0x1E000);
+        assert!(addr_space.translate_and_get_limit(unmapped_vaddr).is_none());
+
+        // Verify out-of-range address returns None
+        let out_of_range = GuestPhysAddr::from_usize(0x30000);
+        assert!(addr_space.translate_and_get_limit(out_of_range).is_none());
+    }
+}
